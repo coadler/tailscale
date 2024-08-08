@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -20,6 +21,7 @@ import (
 	"tailscale.com/internal/noiseconn"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/netmon"
+	"tailscale.com/net/netns"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
@@ -29,6 +31,12 @@ import (
 	"tailscale.com/util/multierr"
 	"tailscale.com/util/singleflight"
 )
+
+var noiseDialerOverride atomic.Pointer[netns.Dialer]
+
+func SetNoiseDialerOverride(d netns.Dialer) {
+	noiseDialerOverride.Store(&d)
+}
 
 // NoiseClient provides a http.Client to connect to tailcontrol over
 // the ts2021 protocol.
@@ -337,6 +345,11 @@ func (nc *NoiseClient) dial(ctx context.Context) (*noiseconn.Conn, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	var d dnscache.DialContextFunc = nc.dialer.SystemDial
+	if do := noiseDialerOverride.Load(); do != nil {
+		d = (*do).DialContext
+	}
+
 	clientConn, err := (&controlhttp.Dialer{
 		Hostname:        nc.host,
 		HTTPPort:        nc.httpPort,
@@ -344,7 +357,7 @@ func (nc *NoiseClient) dial(ctx context.Context) (*noiseconn.Conn, error) {
 		MachineKey:      nc.privKey,
 		ControlKey:      nc.serverPubKey,
 		ProtocolVersion: uint16(tailcfg.CurrentCapabilityVersion),
-		Dialer:          nc.dialer.SystemDial,
+		Dialer:          d,
 		DNSCache:        nc.dnsCache,
 		DialPlan:        dialPlan,
 		Logf:            nc.logf,

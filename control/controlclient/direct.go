@@ -259,6 +259,11 @@ func NewDirect(opts Options) (*Direct, error) {
 		// etc set).
 		httpc = http.DefaultClient
 	}
+	var d dnscache.DialContextFunc = opts.Dialer.SystemDial
+	if do := noiseDialerOverride.Load(); do != nil {
+		d = (*do).DialContext
+	}
+
 	var interceptedDial *atomic.Bool
 	if httpc == nil {
 		tr := http.DefaultTransport.(*http.Transport).Clone()
@@ -266,7 +271,7 @@ func NewDirect(opts Options) (*Direct, error) {
 		tshttpproxy.SetTransportGetProxyConnectHeader(tr)
 		tr.TLSClientConfig = tlsdial.Config(serverURL.Hostname(), opts.HealthTracker, tr.TLSClientConfig)
 		var dialFunc dialFunc
-		dialFunc, interceptedDial = makeScreenTimeDetectingDialFunc(opts.Dialer.SystemDial)
+		dialFunc, interceptedDial = makeScreenTimeDetectingDialFunc(d)
 		tr.DialContext = dnscache.Dialer(dialFunc, dnsCache)
 		tr.DialTLSContext = dnscache.TLSDialer(dialFunc, dnsCache, tr.TLSClientConfig)
 		tr.ForceAttemptHTTP2 = true
