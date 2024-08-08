@@ -53,6 +53,12 @@ func SetDisableBindConnToInterface(v bool) {
 	disableBindConnToInterface.Store(v)
 }
 
+var dialerOverride atomic.Pointer[Dialer]
+
+func SetDialerOverride(d Dialer) {
+	dialerOverride.Store(&d)
+}
+
 // Listener returns a new net.Listener with its Control hook func
 // initialized as necessary to run in logical network namespace that
 // doesn't route back into Tailscale.
@@ -74,6 +80,11 @@ func NewDialer(logf logger.Logf, netMon *netmon.Monitor) Dialer {
 	if netMon == nil {
 		panic("netns.NewDialer called with nil netMon")
 	}
+
+	if do := dialerOverride.Load(); do != nil {
+		return *do
+	}
+
 	return FromDialer(logf, netMon, &net.Dialer{
 		KeepAlive: netknob.PlatformTCPKeepAlive(),
 	})
