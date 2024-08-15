@@ -82,6 +82,10 @@ func ParseNodePrivateUntyped(raw mem.RO) (NodePrivate, error) {
 	return ret, nil
 }
 
+func (k NodePrivate) Raw32() [32]byte {
+	return k.k
+}
+
 // IsZero reports whether k is the zero value.
 func (k NodePrivate) IsZero() bool {
 	return k.Equal(NodePrivate{})
