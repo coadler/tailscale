@@ -252,16 +252,26 @@ func NewDirect(opts Options) (*Direct, error) {
 	}
 
 	httpc := opts.HTTPTestClient
+	var d dnscache.DialContextFunc = opts.Dialer.SystemDial
+	if do := noiseDialerOverride.Load(); do != nil {
+		d = (*do).DialContext
+	}
+
 	if httpc == nil && runtime.GOOS == "js" {
 		// In js/wasm, net/http.Transport (as of Go 1.18) will
 		// only use the browser's Fetch API if you're using
 		// the DefaultClient (or a client without dial hooks
 		// etc set).
-		httpc = http.DefaultClient
-	}
-	var d dnscache.DialContextFunc = opts.Dialer.SystemDial
-	if do := noiseDialerOverride.Load(); do != nil {
-		d = (*do).DialContext
+		httpc = &http.Client{}
+		httpc.Transport = &http.Transport{
+			DialContext: d,
+		}
+		// tr, ok := httpc.Transport.(*http.Transport)
+		// if !ok {
+		// 	panic("transport is invalid type")
+		// }
+
+		// tr.DialContext = d
 	}
 
 	var interceptedDial *atomic.Bool

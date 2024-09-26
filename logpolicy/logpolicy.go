@@ -202,6 +202,8 @@ func LogsDir(logf logger.Logf) string {
 	}
 
 	switch runtime.GOOS {
+	case "js":
+		return ""
 	case "windows":
 		if version.CmdName() == "tailscaled" {
 			// In the common case, when tailscaled is run as the Local System (as a service),

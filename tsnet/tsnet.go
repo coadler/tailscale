@@ -490,23 +490,25 @@ func (s *Server) start() (reterr error) {
 		}
 	}
 
-	if s.rootPath == "" {
-		confDir, err := os.UserConfigDir()
-		if err != nil {
+	if runtime.GOOS != "js" {
+		if s.rootPath == "" {
+			confDir, err := os.UserConfigDir()
+			if err != nil {
+				return err
+			}
+			s.rootPath, err = getTSNetDir(s.logf, confDir, prog)
+			if err != nil {
+				return err
+			}
+		}
+		if err := os.MkdirAll(s.rootPath, 0700); err != nil {
 			return err
 		}
-		s.rootPath, err = getTSNetDir(s.logf, confDir, prog)
-		if err != nil {
+		if fi, err := os.Stat(s.rootPath); err != nil {
 			return err
+		} else if !fi.IsDir() {
+			return fmt.Errorf("%v is not a directory", s.rootPath)
 		}
-	}
-	if err := os.MkdirAll(s.rootPath, 0700); err != nil {
-		return err
-	}
-	if fi, err := os.Stat(s.rootPath); err != nil {
-		return err
-	} else if !fi.IsDir() {
-		return fmt.Errorf("%v is not a directory", s.rootPath)
 	}
 
 	tsLogf := func(format string, a ...any) {
@@ -596,7 +598,7 @@ func (s *Server) start() (reterr error) {
 	if s.Ephemeral {
 		loginFlags = controlclient.LoginEphemeral
 	}
-	lb, err := ipnlocal.NewLocalBackend(tsLogf, s.logid, sys, loginFlags|controlclient.LocalBackendStartKeyOSNeutral)
+	lb, err := ipnlocal.NewLocalBackend(tsLogf, s.logid, sys, loginFlags)
 	if err != nil {
 		return fmt.Errorf("NewLocalBackend: %v", err)
 	}
@@ -654,7 +656,7 @@ func (s *Server) start() (reterr error) {
 }
 
 func (s *Server) startLogger(closePool *closeOnErrorPool, health *health.Tracker, tsLogf logger.Logf) error {
-	if testenv.InTest() {
+	if testenv.InTest() || runtime.GOOS == "js" {
 		return nil
 	}
 	cfgPath := filepath.Join(s.rootPath, "tailscaled.log.conf")

@@ -1,6 +1,8 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+//go:build js
+
 package controlhttp
 
 import (
@@ -20,6 +22,10 @@ import (
 func (d *Dialer) Dial(ctx context.Context) (*ClientConn, error) {
 	if d.Hostname == "" {
 		return nil, errors.New("required Dialer.Hostname empty")
+	}
+
+	if d.Dialer != nil {
+		return d.dial(ctx)
 	}
 
 	init, cont, err := controlbase.ClientDeferred(d.MachineKey, d.ControlKey, d.ProtocolVersion)
