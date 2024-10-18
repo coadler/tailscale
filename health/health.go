@@ -8,6 +8,7 @@ package health
 import (
 	"context"
 	"errors"
+	"expvar"
 	"fmt"
 	"maps"
 	"net/http"
@@ -19,12 +20,14 @@ import (
 	"time"
 
 	"tailscale.com/envknob"
+	"tailscale.com/metrics"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/opt"
 	"tailscale.com/util/cibuild"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/multierr"
 	"tailscale.com/util/set"
+	"tailscale.com/util/usermetric"
 	"tailscale.com/version"
 )
 
@@ -65,6 +68,11 @@ type Tracker struct {
 	// magicsock receive functions: IPv4, IPv6, and DERP.
 	MagicSockReceiveFuncs [3]ReceiveFuncStats // indexed by ReceiveFunc values
 
+	// initOnce guards the initialization of the Tracker.
+	// Notably, it initializes the MagicSockReceiveFuncs names.
+	// mu should not be held during init.
+	initOnce sync.Once
+
 	// mu guards everything that follows.
 	mu sync.Mutex
 
@@ -88,6 +96,7 @@ type Tracker struct {
 	inMapPollSince          time.Time
 	lastMapPollEndedAt      time.Time
 	lastStreamedMapResponse time.Time
+	lastNoiseDial           time.Time
 	derpHomeRegion          int
 	derpHomeless            bool
 	derpRegionConnected     map[int]bool
@@ -99,11 +108,11 @@ type Tracker struct {
 	ipnWantRunning          bool
 	ipnWantRunningLastTrue  time.Time // when ipnWantRunning last changed false -> true
 	anyInterfaceUp          opt.Bool  // empty means unknown (assume true)
-	udp4Unbound             bool
 	controlHealth           []string
 	lastLoginErr            error
 	localLogConfigErr       error
 	tlsConnectionErrors     map[string]error // map[ServerName]error
+	metricHealthMessage     *metrics.MultiLabelMap[metricHealthMessageLabel]
 }
 
 // Subsystem is the name of a subsystem whose health can be monitored.
@@ -310,6 +319,33 @@ func (w *Warnable) IsVisible(ws *warningState) bool {
 	return time.Since(ws.BrokenSince) >= w.TimeToVisible
 }
 
+// SetMetricsRegistry sets up the metrics for the Tracker. It takes
+// a usermetric.Registry and registers the metrics there.
+func (t *Tracker) SetMetricsRegistry(reg *usermetric.Registry) {
+	if reg == nil || t.metricHealthMessage != nil {
+		return
+	}
+
+	t.metricHealthMessage = usermetric.NewMultiLabelMapWithRegistry[metricHealthMessageLabel](
+		reg,
+		"tailscaled_health_messages",
+		"gauge",
+		"Number of health messages broken down by type.",
+	)
+
+	t.metricHealthMessage.Set(metricHealthMessageLabel{
+		Type: "warning",
+	}, expvar.Func(func() any {
+		if t.nil() {
+			return 0
+		}
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		t.updateBuiltinWarnablesLocked()
+		return int64(len(t.stringsLocked()))
+	}))
+}
+
 // SetUnhealthy sets a warningState for the given Warnable with the provided Args, and should be
 // called when a Warnable becomes unhealthy, or its unhealthy status needs to be updated.
 // SetUnhealthy takes ownership of args. The args can be nil if no additional information is
@@ -433,6 +469,7 @@ func (t *Tracker) RegisterWatcher(cb func(w *Warnable, r *UnhealthyState)) (unre
 	if t.nil() {
 		return func() {}
 	}
+	t.initOnce.Do(t.doOnceInit)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.watchers == nil {
@@ -806,8 +843,12 @@ func (t *Tracker) SetUDP4Unbound(unbound bool) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.udp4Unbound = unbound
-	t.selfCheckLocked()
+
+	if unbound {
+		t.setUnhealthyLocked(noUDP4BindWarnable, nil)
+	} else {
+		t.setHealthyLocked(noUDP4BindWarnable)
+	}
 }
 
 // SetAuthRoutineInError records the latest error encountered as a result of a
@@ -859,6 +900,7 @@ func (t *Tracker) timerSelfCheck() {
 	if t.nil() {
 		return
 	}
+	t.initOnce.Do(t.doOnceInit)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.checkReceiveFuncsLocked()
@@ -964,7 +1006,6 @@ func (t *Tracker) updateBuiltinWarnablesLocked() {
 
 	if v, ok := t.anyInterfaceUp.Get(); ok && !v {
 		t.setUnhealthyLocked(NetworkStatusWarnable, nil)
-		return
 	} else {
 		t.setHealthyLocked(NetworkStatusWarnable)
 	}
@@ -973,9 +1014,48 @@ func (t *Tracker) updateBuiltinWarnablesLocked() {
 		t.setUnhealthyLocked(localLogWarnable, Args{
 			ArgError: t.localLogConfigErr.Error(),
 		})
-		return
 	} else {
 		t.setHealthyLocked(localLogWarnable)
+	}
+
+	now := time.Now()
+
+	// How long we assume we'll have heard a DERP frame or a MapResponse
+	// KeepAlive by.
+	const tooIdle = 2*time.Minute + 5*time.Second
+
+	// Whether user recently turned on Tailscale.
+	recentlyOn := now.Sub(t.ipnWantRunningLastTrue) < 5*time.Second
+
+	homeDERP := t.derpHomeRegion
+	if recentlyOn {
+		// If user just turned Tailscale on, don't warn for a bit.
+		t.setHealthyLocked(noDERPHomeWarnable)
+		t.setHealthyLocked(noDERPConnectionWarnable)
+		t.setHealthyLocked(derpTimeoutWarnable)
+	} else if !t.ipnWantRunning || t.derpHomeless || homeDERP != 0 {
+		t.setHealthyLocked(noDERPHomeWarnable)
+	} else {
+		t.setUnhealthyLocked(noDERPHomeWarnable, nil)
+	}
+
+	if homeDERP != 0 && t.derpRegionConnected[homeDERP] {
+		t.setHealthyLocked(noDERPConnectionWarnable)
+
+		if d := now.Sub(t.derpRegionLastFrame[homeDERP]); d < tooIdle {
+			t.setHealthyLocked(derpTimeoutWarnable)
+		} else {
+			t.setUnhealthyLocked(derpTimeoutWarnable, Args{
+				ArgDERPRegionID:   fmt.Sprint(homeDERP),
+				ArgDERPRegionName: t.derpRegionNameLocked(homeDERP),
+				ArgDuration:       d.Round(time.Second).String(),
+			})
+		}
+	} else {
+		t.setUnhealthyLocked(noDERPConnectionWarnable, Args{
+			ArgDERPRegionID:   fmt.Sprint(homeDERP),
+			ArgDERPRegionName: t.derpRegionNameLocked(homeDERP),
+		})
 	}
 
 	if !t.ipnWantRunning {
@@ -1000,7 +1080,6 @@ func (t *Tracker) updateBuiltinWarnablesLocked() {
 		t.setHealthyLocked(LoginStateWarnable)
 	}
 
-	now := time.Now()
 	if !t.inMapPoll && (t.lastMapPollEndedAt.IsZero() || now.Sub(t.lastMapPollEndedAt) > 10*time.Second) {
 		t.setUnhealthyLocked(notInMapPollWarnable, nil)
 		return
@@ -1008,7 +1087,6 @@ func (t *Tracker) updateBuiltinWarnablesLocked() {
 		t.setHealthyLocked(notInMapPollWarnable)
 	}
 
-	const tooIdle = 2*time.Minute + 5*time.Second
 	if d := now.Sub(t.lastStreamedMapResponse).Round(time.Second); d > tooIdle {
 		t.setUnhealthyLocked(mapResponseTimeoutWarnable, Args{
 			ArgDuration: d.String(),
@@ -1018,44 +1096,13 @@ func (t *Tracker) updateBuiltinWarnablesLocked() {
 		t.setHealthyLocked(mapResponseTimeoutWarnable)
 	}
 
-	if !t.derpHomeless {
-		rid := t.derpHomeRegion
-		if rid == 0 {
-			t.setUnhealthyLocked(noDERPHomeWarnable, nil)
-			return
-		} else if !t.derpRegionConnected[rid] {
-			t.setUnhealthyLocked(noDERPConnectionWarnable, Args{
-				ArgDERPRegionID:   fmt.Sprint(rid),
-				ArgDERPRegionName: t.derpRegionNameLocked(rid),
-			})
-			return
-		} else if d := now.Sub(t.derpRegionLastFrame[rid]).Round(time.Second); d > tooIdle {
-			t.setUnhealthyLocked(derpTimeoutWarnable, Args{
-				ArgDERPRegionID:   fmt.Sprint(rid),
-				ArgDERPRegionName: t.derpRegionNameLocked(rid),
-				ArgDuration:       d.String(),
-			})
-			return
-		}
-	}
-	t.setHealthyLocked(noDERPHomeWarnable)
-	t.setHealthyLocked(noDERPConnectionWarnable)
-	t.setHealthyLocked(derpTimeoutWarnable)
-
-	if t.udp4Unbound {
-		t.setUnhealthyLocked(noUDP4BindWarnable, nil)
-		return
-	} else {
-		t.setHealthyLocked(noUDP4BindWarnable)
-	}
-
 	// TODO: use
 	_ = t.inMapPollSince
 	_ = t.lastMapPollEndedAt
 	_ = t.lastStreamedMapResponse
 	_ = t.lastMapRequestHeard
 
-	shouldClearMagicsockWarnings := false
+	shouldClearMagicsockWarnings := true
 	for i := range t.MagicSockReceiveFuncs {
 		f := &t.MagicSockReceiveFuncs[i]
 		if f.missing {
@@ -1063,6 +1110,7 @@ func (t *Tracker) updateBuiltinWarnablesLocked() {
 				ArgMagicsockFunctionName: f.name,
 			})
 			shouldClearMagicsockWarnings = false
+			break
 		}
 	}
 	if shouldClearMagicsockWarnings {
@@ -1168,6 +1216,11 @@ type ReceiveFuncStats struct {
 	missing bool
 }
 
+// Name returns the name of the receive func ("ReceiveIPv4", "ReceiveIPv6", etc).
+func (s *ReceiveFuncStats) Name() string {
+	return s.name
+}
+
 func (s *ReceiveFuncStats) Enter() {
 	s.numCalls.Add(1)
 	s.inCall.Store(true)
@@ -1185,15 +1238,20 @@ func (t *Tracker) ReceiveFuncStats(which ReceiveFunc) *ReceiveFuncStats {
 	if t == nil {
 		return nil
 	}
+	t.initOnce.Do(t.doOnceInit)
 	return &t.MagicSockReceiveFuncs[which]
+}
+
+func (t *Tracker) doOnceInit() {
+	for i := range t.MagicSockReceiveFuncs {
+		f := &t.MagicSockReceiveFuncs[i]
+		f.name = (ReceiveFunc(i)).String()
+	}
 }
 
 func (t *Tracker) checkReceiveFuncsLocked() {
 	for i := range t.MagicSockReceiveFuncs {
 		f := &t.MagicSockReceiveFuncs[i]
-		if f.name == "" {
-			f.name = (ReceiveFunc(i)).String()
-		}
 		if runtime.GOOS == "js" && i < 2 {
 			// Skip IPv4 and IPv6 on js.
 			continue
@@ -1214,4 +1272,27 @@ func (t *Tracker) checkReceiveFuncsLocked() {
 		// It is probably MIA.
 		f.missing = true
 	}
+}
+
+// LastNoiseDialWasRecent notes that we're attempting to dial control via the
+// ts2021 noise protocol and reports whether the prior dial was "recent"
+// (currently defined as 2 minutes but subject to change).
+//
+// If t is nil, it reports false.
+func (t *Tracker) LastNoiseDialWasRecent() bool {
+	if t.nil() {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	now := time.Now()
+	dur := now.Sub(t.lastNoiseDial)
+	t.lastNoiseDial = now
+	return dur < 2*time.Minute
+}
+
+type metricHealthMessageLabel struct {
+	// TODO: break down by warnable.severity as well?
+	Type string
 }

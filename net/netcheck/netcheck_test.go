@@ -7,12 +7,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
 	"reflect"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -38,7 +38,7 @@ func TestBasic(t *testing.T) {
 
 	c := newTestClient(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	if err := c.Standalone(ctx, "127.0.0.1:0"); err != nil {
@@ -117,7 +117,7 @@ func TestWorksWhenUDPBlocked(t *testing.T) {
 
 	c := newTestClient(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	r, err := c.GetReport(ctx, dm, nil)
@@ -593,13 +593,7 @@ func TestMakeProbePlan(t *testing.T) {
 
 func (plan probePlan) String() string {
 	var sb strings.Builder
-	keys := []string{}
-	for k := range plan {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	for _, key := range keys {
+	for _, key := range slices.Sorted(maps.Keys(plan)) {
 		fmt.Fprintf(&sb, "[%s]", key)
 		pv := plan[key]
 		for _, p := range pv {
@@ -864,5 +858,44 @@ func TestNodeAddrResolve(t *testing.T) {
 				t.Logf("correctly got invalid addr")
 			})
 		})
+	}
+}
+
+func TestReportTimeouts(t *testing.T) {
+	if ReportTimeout < stunProbeTimeout {
+		t.Errorf("ReportTimeout (%v) cannot be less than stunProbeTimeout (%v)", ReportTimeout, stunProbeTimeout)
+	}
+	if ReportTimeout < icmpProbeTimeout {
+		t.Errorf("ReportTimeout (%v) cannot be less than icmpProbeTimeout (%v)", ReportTimeout, icmpProbeTimeout)
+	}
+	if ReportTimeout < httpsProbeTimeout {
+		t.Errorf("ReportTimeout (%v) cannot be less than httpsProbeTimeout (%v)", ReportTimeout, httpsProbeTimeout)
+	}
+}
+
+func TestNoUDPNilGetReportOpts(t *testing.T) {
+	blackhole, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to open blackhole STUN listener: %v", err)
+	}
+	defer blackhole.Close()
+
+	dm := stuntest.DERPMapOf(blackhole.LocalAddr().String())
+	for _, region := range dm.Regions {
+		for _, n := range region.Nodes {
+			n.STUNOnly = false // exercise ICMP & HTTPS probing
+		}
+	}
+
+	c := newTestClient(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	r, err := c.GetReport(ctx, dm, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.UDP {
+		t.Fatal("unexpected working UDP")
 	}
 }

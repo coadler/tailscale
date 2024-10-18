@@ -147,7 +147,9 @@ type CapabilityVersion int
 //   - 102: 2024-07-12: NodeAttrDisableMagicSockCryptoRouting support
 //   - 103: 2024-07-24: Client supports NodeAttrDisableCaptivePortalDetection
 //   - 104: 2024-08-03: SelfNodeV6MasqAddrForThisPeer now works
-const CurrentCapabilityVersion CapabilityVersion = 104
+//   - 105: 2024-08-05: Fixed SSH behavior on systems that use busybox (issue #12849)
+//   - 106: 2024-09-03: fix panic regression from cryptokey routing change (65fe0ba7b5)
+const CurrentCapabilityVersion CapabilityVersion = 106
 
 type StableID string
 
@@ -649,6 +651,21 @@ func CheckTag(tag string) error {
 	return nil
 }
 
+// CheckServiceName validates svc for use as a service name.
+// We only allow valid DNS labels, since the expectation is that these will be
+// used as parts of domain names.
+func CheckServiceName(svc string) error {
+	var ok bool
+	svc, ok = strings.CutPrefix(svc, "svc:")
+	if !ok {
+		return errors.New("services must start with 'svc:'")
+	}
+	if svc == "" {
+		return errors.New("service names must not be empty")
+	}
+	return dnsname.ValidLabel(svc)
+}
+
 // CheckRequestTags checks that all of h.RequestTags are valid.
 func (h *Hostinfo) CheckRequestTags() error {
 	if h == nil {
@@ -674,6 +691,16 @@ const (
 	PeerAPI6   = ServiceProto("peerapi6")
 	PeerAPIDNS = ServiceProto("peerapi-dns-proxy")
 )
+
+// IsKnownServiceProto checks whether sp represents a known-valid value of
+// ServiceProto.
+func IsKnownServiceProto(sp ServiceProto) bool {
+	switch sp {
+	case TCP, UDP, PeerAPI4, PeerAPI6, PeerAPIDNS, ServiceProto("egg"):
+		return true
+	}
+	return false
+}
 
 // Service represents a service running on a node.
 type Service struct {
@@ -759,7 +786,7 @@ type Hostinfo struct {
 	// "5.10.0-17-amd64".
 	OSVersion string `json:",omitempty"`
 
-	Container      opt.Bool `json:",omitempty"` // whether the client is running in a container
+	Container      opt.Bool `json:",omitempty"` // best-effort whether the client is running in a container
 	Env            string   `json:",omitempty"` // a hostinfo.EnvType in string form
 	Distro         string   `json:",omitempty"` // "debian", "ubuntu", "nixos", ...
 	DistroVersion  string   `json:",omitempty"` // "20.04", ...
@@ -2306,6 +2333,13 @@ const (
 	// Added 2024-05-29 in Tailscale version 1.68.
 	NodeAttrSSHBehaviorV1 NodeCapability = "ssh-behavior-v1"
 
+	// NodeAttrSSHBehaviorV2 forces SSH to use the V2 behavior (use su, run SFTP in child process).
+	// This overrides NodeAttrSSHBehaviorV1 if set.
+	// See forceV1Behavior in ssh/tailssh/incubator.go for distinction between
+	// V1 and V2 behavior.
+	// Added 2024-08-06 in Tailscale version 1.72.
+	NodeAttrSSHBehaviorV2 NodeCapability = "ssh-behavior-v2"
+
 	// NodeAttrDisableSplitDNSWhenNoCustomResolvers indicates that the node's
 	// DNS manager should not adopt a split DNS configuration even though the
 	// Config of the resolver only contains routes that do not specify custom
@@ -2333,6 +2367,10 @@ const (
 	// NodeAttrDisableCaptivePortalDetection instructs the client to not perform captive portal detection
 	// automatically when the network state changes.
 	NodeAttrDisableCaptivePortalDetection NodeCapability = "disable-captive-portal-detection"
+
+	// NodeAttrSSHEnvironmentVariables enables logic for handling environment variables sent
+	// via SendEnv in the SSH server and applying them to the SSH session.
+	NodeAttrSSHEnvironmentVariables NodeCapability = "ssh-env-vars"
 )
 
 // SetDNSRequest is a request to add a DNS record.
@@ -2438,6 +2476,13 @@ type SSHRule struct {
 	// Action is the outcome to task.
 	// A nil or invalid action means to deny.
 	Action *SSHAction `json:"action"`
+
+	// AcceptEnv is a slice of environment variable names that are allowlisted
+	// for the SSH rule in the policy file.
+	//
+	// AcceptEnv values may contain * and ? wildcard characters which match against
+	// an arbitrary number of characters or a single character respectively.
+	AcceptEnv []string `json:"acceptEnv,omitempty"`
 }
 
 // SSHPrincipal is either a particular node or a user on any node.

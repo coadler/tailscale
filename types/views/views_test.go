@@ -6,8 +6,10 @@ package views
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/netip"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"unsafe"
@@ -410,5 +412,92 @@ func TestContainsPointers(t *testing.T) {
 				t.Errorf("got %v; want %v", gotPtrs, tt.wantPtrs)
 			}
 		})
+	}
+}
+
+func TestSliceRange(t *testing.T) {
+	sv := SliceOf([]string{"foo", "bar"})
+	var got []string
+	for i, v := range sv.All() {
+		got = append(got, fmt.Sprintf("%d-%s", i, v))
+	}
+	want := []string{"0-foo", "1-bar"}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %q; want %q", got, want)
+	}
+}
+
+type testStruct struct{ value string }
+
+func (p *testStruct) Clone() *testStruct {
+	if p == nil {
+		return p
+	}
+	return &testStruct{p.value}
+}
+func (p *testStruct) View() testStructView { return testStructView{p} }
+
+type testStructView struct{ p *testStruct }
+
+func (v testStructView) Valid() bool { return v.p != nil }
+func (v testStructView) AsStruct() *testStruct {
+	if v.p == nil {
+		return nil
+	}
+	return v.p.Clone()
+}
+func (v testStructView) ValueForTest() string { return v.p.value }
+
+func TestSliceViewRange(t *testing.T) {
+	vs := SliceOfViews([]*testStruct{{value: "foo"}, {value: "bar"}})
+	var got []string
+	for i, v := range vs.All() {
+		got = append(got, fmt.Sprintf("%d-%s", i, v.AsStruct().value))
+	}
+	want := []string{"0-foo", "1-bar"}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %q; want %q", got, want)
+	}
+}
+
+func TestMapIter(t *testing.T) {
+	m := MapOf(map[string]int{"foo": 1, "bar": 2})
+	var got []string
+	for k, v := range m.All() {
+		got = append(got, fmt.Sprintf("%s-%d", k, v))
+	}
+	slices.Sort(got)
+	want := []string{"bar-2", "foo-1"}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %q; want %q", got, want)
+	}
+}
+
+func TestMapSliceIter(t *testing.T) {
+	m := MapSliceOf(map[string][]int{"foo": {3, 4}, "bar": {1, 2}})
+	var got []string
+	for k, v := range m.All() {
+		got = append(got, fmt.Sprintf("%s-%d", k, v))
+	}
+	slices.Sort(got)
+	want := []string{"bar-{[1 2]}", "foo-{[3 4]}"}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %q; want %q", got, want)
+	}
+}
+
+func TestMapFnIter(t *testing.T) {
+	m := MapFnOf[string, *testStruct, testStructView](map[string]*testStruct{
+		"foo": {value: "fooVal"},
+		"bar": {value: "barVal"},
+	}, func(p *testStruct) testStructView { return testStructView{p} })
+	var got []string
+	for k, v := range m.All() {
+		got = append(got, fmt.Sprintf("%v-%v", k, v.ValueForTest()))
+	}
+	slices.Sort(got)
+	want := []string{"bar-barVal", "foo-fooVal"}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %q; want %q", got, want)
 	}
 }

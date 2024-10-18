@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package tsnet provides Tailscale as a library.
-//
-// It is an experimental work in progress.
 package tsnet
 
 import (
@@ -540,12 +538,14 @@ func (s *Server) start() (reterr error) {
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
 		HealthTracker: sys.HealthTracker(),
+		Metrics:       sys.UserMetricsRegistry(),
 	})
 	if err != nil {
 		return err
 	}
 	closePool.add(s.dialer)
 	sys.Set(eng)
+	sys.HealthTracker().SetMetricsRegistry(sys.UserMetricsRegistry())
 
 	// TODO(oxtoacart): do we need to support Taildrive on tsnet, and if so, how?
 	ns, err := netstack.Create(tsLogf, sys.Tun.Get(), eng, sys.MagicSock.Get(), s.dialer, sys.DNSManager.Get(), sys.ProxyMapper(), nil)
@@ -905,6 +905,7 @@ func (s *Server) APIClient() (*tailscale.Client, error) {
 	}
 
 	c := tailscale.NewClient("-", nil)
+	c.UserAgent = "tailscale-tsnet"
 	c.HTTPClient = &http.Client{Transport: s.lb.KeyProvingNoiseRoundTripper()}
 	return c, nil
 }

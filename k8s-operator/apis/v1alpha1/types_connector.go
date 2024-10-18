@@ -29,7 +29,7 @@ var ConnectorKind = "Connector"
 // exit node.
 // Connector is a cluster-scoped resource.
 // More info:
-// https://tailscale.com/kb/1236/kubernetes-operator#deploying-exit-nodes-and-subnet-routers-on-kubernetes-using-connector-custom-resource
+// https://tailscale.com/kb/1441/kubernetes-operator-connector
 type Connector struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -62,7 +62,7 @@ type ConnectorSpec struct {
 	// To autoapprove the subnet routes or exit node defined by a Connector,
 	// you can configure Tailscale ACLs to give these tags the necessary
 	// permissions.
-	// See https://tailscale.com/kb/1018/acls/#auto-approvers-for-routes-and-exit-nodes.
+	// See https://tailscale.com/kb/1337/acl-syntax#autoapprovers.
 	// If you specify custom tags here, you must also make the operator an owner of these tags.
 	// See  https://tailscale.com/kb/1236/kubernetes-operator/#setting-up-the-kubernetes-operator.
 	// Tags cannot be changed once a Connector node has been created.
@@ -171,6 +171,20 @@ type ConditionType string
 
 const (
 	ConnectorReady  ConditionType = `ConnectorReady`
-	ProxyClassready ConditionType = `ProxyClassReady`
+	ProxyClassReady ConditionType = `ProxyClassReady`
+	ProxyGroupReady ConditionType = `ProxyGroupReady`
 	ProxyReady      ConditionType = `TailscaleProxyReady` // a Tailscale-specific condition type for corev1.Service
+	RecorderReady   ConditionType = `RecorderReady`
+	// EgressSvcValid gets set on a user configured ExternalName Service that defines a tailnet target to be exposed
+	// on a ProxyGroup.
+	// Set to true if the user provided configuration is valid.
+	EgressSvcValid ConditionType = `TailscaleEgressSvcValid`
+	// EgressSvcConfigured gets set on a user configured ExternalName Service that defines a tailnet target to be exposed
+	// on a ProxyGroup.
+	// Set to true if the cluster resources for the service have been successfully configured.
+	EgressSvcConfigured ConditionType = `TailscaleEgressSvcConfigured`
+	// EgressSvcReady gets set on a user configured ExternalName Service that defines a tailnet target to be exposed
+	// on a ProxyGroup.
+	// Set to true if the service is ready to route cluster traffic.
+	EgressSvcReady ConditionType = `TailscaleEgressSvcReady`
 )

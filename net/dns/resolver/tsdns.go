@@ -321,20 +321,18 @@ func (r *Resolver) Query(ctx context.Context, bs []byte, family string, from net
 		defer cancel()
 		err = r.forwarder.forwardWithDestChan(ctx, packet{bs, family, from}, responses)
 		if err != nil {
-			select {
-			// Best effort: use any error response sent by forwardWithDestChan.
-			// This is present in some errors paths, such as when all upstream
-			// DNS servers replied with an error.
-			case resp := <-responses:
-				return resp.bs, err
-			default:
-				return nil, err
-			}
+			return nil, err
 		}
 		return (<-responses).bs, nil
 	}
 
 	return out, err
+}
+
+// GetUpstreamResolvers returns the resolvers that would be used to resolve
+// the given FQDN.
+func (r *Resolver) GetUpstreamResolvers(name dnsname.FQDN) []*dnstype.Resolver {
+	return r.forwarder.GetUpstreamResolvers(name)
 }
 
 // parseExitNodeQuery parses a DNS request packet.

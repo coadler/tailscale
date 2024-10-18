@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"expvar"
 	"fmt"
 	"io"
 	"net"
@@ -60,6 +61,7 @@ import (
 	"tailscale.com/util/set"
 	"tailscale.com/util/testenv"
 	"tailscale.com/util/uniq"
+	"tailscale.com/util/usermetric"
 	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/wgint"
 )
@@ -78,6 +80,54 @@ const (
 	// will silently clamp the value.
 	socketBufferSize = 7 << 20
 )
+
+// Path is a label indicating the type of path a packet took.
+type Path string
+
+const (
+	PathDirectIPv4 Path = "direct_ipv4"
+	PathDirectIPv6 Path = "direct_ipv6"
+	PathDERP       Path = "derp"
+)
+
+type pathLabel struct {
+	// Path indicates the path that the packet took:
+	// - direct_ipv4
+	// - direct_ipv6
+	// - derp
+	Path Path
+}
+
+// metrics in wgengine contains the usermetrics counters for magicsock, it
+// is however a bit special. All them metrics are labeled, but looking up
+// the metric everytime we need to record it has an overhead, and includes
+// a lock in MultiLabelMap. The metrics are therefore instead created with
+// wgengine and the underlying expvar.Int is stored to be used directly.
+type metrics struct {
+	// inboundPacketsTotal is the total number of inbound packets received,
+	// labeled by the path the packet took.
+	inboundPacketsIPv4Total expvar.Int
+	inboundPacketsIPv6Total expvar.Int
+	inboundPacketsDERPTotal expvar.Int
+
+	// inboundBytesTotal is the total number of inbound bytes received,
+	// labeled by the path the packet took.
+	inboundBytesIPv4Total expvar.Int
+	inboundBytesIPv6Total expvar.Int
+	inboundBytesDERPTotal expvar.Int
+
+	// outboundPacketsTotal is the total number of outbound packets sent,
+	// labeled by the path the packet took.
+	outboundPacketsIPv4Total expvar.Int
+	outboundPacketsIPv6Total expvar.Int
+	outboundPacketsDERPTotal expvar.Int
+
+	// outboundBytesTotal is the total number of outbound bytes sent,
+	// labeled by the path the packet took.
+	outboundBytesIPv4Total expvar.Int
+	outboundBytesIPv6Total expvar.Int
+	outboundBytesDERPTotal expvar.Int
+}
 
 // A Conn routes UDP packets and actively manages a list of its endpoints.
 type Conn struct {
@@ -320,6 +370,9 @@ type Conn struct {
 	// responsibility to ensure that traffic from these endpoints is routed
 	// to the node.
 	staticEndpoints views.Slice[netip.AddrPort]
+
+	// metrics contains the metrics for the magicsock instance.
+	metrics *metrics
 }
 
 // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
@@ -385,6 +438,9 @@ type Options struct {
 	// HealthTracker optionally specifies the health tracker to
 	// report errors and warnings to.
 	HealthTracker *health.Tracker
+
+	// Metrics specifies the metrics registry to record metrics to.
+	Metrics *usermetric.Registry
 
 	// ControlKnobs are the set of control knobs to use.
 	// If nil, they're ignored and not updated.
@@ -491,35 +547,101 @@ func NewConn(opts Options) (*Conn, error) {
 	c.connCtx, c.connCtxCancel = context.WithCancel(context.Background())
 	c.donec = c.connCtx.Done()
 	c.netChecker = &netcheck.Client{
-		Logf:   logger.WithPrefix(c.logf, "netcheck: "),
-		NetMon: c.netMon,
-		SendPacket: func(b []byte, ap netip.AddrPort) (int, error) {
-			ok, err := c.sendUDP(ap, b)
-			if !ok {
-				return 0, err
-			}
-			return len(b), err
-		},
+		Logf:                logger.WithPrefix(c.logf, "netcheck: "),
+		NetMon:              c.netMon,
+		SendPacket:          c.sendUDPNetcheck,
 		SkipExternalNetwork: inTest(),
 		PortMapper:          c.portMapper,
 		UseDNSCache:         true,
 	}
 
+	c.metrics = registerMetrics(opts.Metrics)
+
 	if d4, err := c.listenRawDisco("ip4"); err == nil {
 		c.logf("[v1] using BPF disco receiver for IPv4")
 		c.closeDisco4 = d4
-	} else {
+	} else if !errors.Is(err, errors.ErrUnsupported) {
 		c.logf("[v1] couldn't create raw v4 disco listener, using regular listener instead: %v", err)
 	}
 	if d6, err := c.listenRawDisco("ip6"); err == nil {
 		c.logf("[v1] using BPF disco receiver for IPv6")
 		c.closeDisco6 = d6
-	} else {
+	} else if !errors.Is(err, errors.ErrUnsupported) {
 		c.logf("[v1] couldn't create raw v6 disco listener, using regular listener instead: %v", err)
 	}
 
 	c.logf("magicsock: disco key = %v", c.discoShort)
 	return c, nil
+}
+
+// registerMetrics wires up the metrics for wgengine, instead of
+// registering the label metric directly, the underlying expvar is exposed.
+// See metrics for more info.
+func registerMetrics(reg *usermetric.Registry) *metrics {
+	pathDirectV4 := pathLabel{Path: PathDirectIPv4}
+	pathDirectV6 := pathLabel{Path: PathDirectIPv6}
+	pathDERP := pathLabel{Path: PathDERP}
+	inboundPacketsTotal := usermetric.NewMultiLabelMapWithRegistry[pathLabel](
+		reg,
+		"tailscaled_inbound_packets_total",
+		"counter",
+		"Counts the number of packets received from other peers",
+	)
+	inboundBytesTotal := usermetric.NewMultiLabelMapWithRegistry[pathLabel](
+		reg,
+		"tailscaled_inbound_bytes_total",
+		"counter",
+		"Counts the number of bytes received from other peers",
+	)
+	outboundPacketsTotal := usermetric.NewMultiLabelMapWithRegistry[pathLabel](
+		reg,
+		"tailscaled_outbound_packets_total",
+		"counter",
+		"Counts the number of packets sent to other peers",
+	)
+	outboundBytesTotal := usermetric.NewMultiLabelMapWithRegistry[pathLabel](
+		reg,
+		"tailscaled_outbound_bytes_total",
+		"counter",
+		"Counts the number of bytes sent to other peers",
+	)
+	m := new(metrics)
+
+	// Map clientmetrics to the usermetric counters.
+	metricRecvDataPacketsIPv4.Register(&m.inboundPacketsIPv4Total)
+	metricRecvDataPacketsIPv6.Register(&m.inboundPacketsIPv6Total)
+	metricRecvDataPacketsDERP.Register(&m.inboundPacketsDERPTotal)
+	metricSendUDP.Register(&m.outboundPacketsIPv4Total)
+	metricSendUDP.Register(&m.outboundPacketsIPv6Total)
+	metricSendDERP.Register(&m.outboundPacketsDERPTotal)
+
+	inboundPacketsTotal.Set(pathDirectV4, &m.inboundPacketsIPv4Total)
+	inboundPacketsTotal.Set(pathDirectV6, &m.inboundPacketsIPv6Total)
+	inboundPacketsTotal.Set(pathDERP, &m.inboundPacketsDERPTotal)
+
+	inboundBytesTotal.Set(pathDirectV4, &m.inboundBytesIPv4Total)
+	inboundBytesTotal.Set(pathDirectV6, &m.inboundBytesIPv6Total)
+	inboundBytesTotal.Set(pathDERP, &m.inboundBytesDERPTotal)
+
+	outboundPacketsTotal.Set(pathDirectV4, &m.outboundPacketsIPv4Total)
+	outboundPacketsTotal.Set(pathDirectV6, &m.outboundPacketsIPv6Total)
+	outboundPacketsTotal.Set(pathDERP, &m.outboundPacketsDERPTotal)
+
+	outboundBytesTotal.Set(pathDirectV4, &m.outboundBytesIPv4Total)
+	outboundBytesTotal.Set(pathDirectV6, &m.outboundBytesIPv6Total)
+	outboundBytesTotal.Set(pathDERP, &m.outboundBytesDERPTotal)
+
+	return m
+}
+
+// deregisterMetrics unregisters the underlying usermetrics expvar counters
+// from clientmetrics.
+func deregisterMetrics(m *metrics) {
+	metricRecvDataPacketsIPv4.UnregisterAll()
+	metricRecvDataPacketsIPv6.UnregisterAll()
+	metricRecvDataPacketsDERP.UnregisterAll()
+	metricSendUDP.UnregisterAll()
+	metricSendDERP.UnregisterAll()
 }
 
 // InstallCaptureHook installs a callback which is called to
@@ -582,7 +704,7 @@ func (c *Conn) updateEndpoints(why string) {
 		c.muCond.Broadcast()
 	}()
 	c.dlogf("[v1] magicsock: starting endpoint update (%s)", why)
-	if c.noV4Send.Load() && runtime.GOOS != "js" {
+	if c.noV4Send.Load() && runtime.GOOS != "js" && !c.onlyTCP443.Load() {
 		c.mu.Lock()
 		closed := c.closed
 		c.mu.Unlock()
@@ -688,9 +810,6 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 		return new(netcheck.Report), nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-
 	report, err := c.netChecker.GetReport(ctx, dm, &netcheck.GetReportOpts{
 		// Pass information about the last time that we received a
 		// frame from a DERP server to our netchecker to help avoid
@@ -701,6 +820,7 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 		// health package here, but I'd rather do that and not store
 		// the exact same state in two different places.
 		GetLastDERPActivity: c.health.GetDERPRegionReceivedTime,
+		OnlyTCP443:          c.onlyTCP443.Load(),
 	})
 	if err != nil {
 		return nil, err
@@ -1089,7 +1209,13 @@ func (c *Conn) Send(buffs [][]byte, ep conn.Endpoint) error {
 		metricSendDataNetworkDown.Add(n)
 		return errNetworkDown
 	}
-	return ep.(*endpoint).send(buffs)
+	if ep, ok := ep.(*endpoint); ok {
+		return ep.send(buffs)
+	}
+	// If it's not of type *endpoint, it's probably *lazyEndpoint, which means
+	// we don't actually know who the peer is and we're waiting for wireguard-go
+	// to switch the endpoint. See go/corp/20732.
+	return nil
 }
 
 var errConnClosed = errors.New("Conn closed")
@@ -1138,7 +1264,14 @@ func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte) (sent bool, err error) {
 		_ = c.maybeRebindOnError(runtime.GOOS, err)
 	} else {
 		if sent {
-			metricSendUDP.Add(1)
+			switch {
+			case ipp.Addr().Is4():
+				c.metrics.outboundPacketsIPv4Total.Add(1)
+				c.metrics.outboundBytesIPv4Total.Add(int64(len(b)))
+			case ipp.Addr().Is6():
+				c.metrics.outboundPacketsIPv6Total.Add(1)
+				c.metrics.outboundBytesIPv6Total.Add(int64(len(b)))
+			}
 		}
 	}
 	return
@@ -1147,8 +1280,8 @@ func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte) (sent bool, err error) {
 // maybeRebindOnError performs a rebind and restun if the error is defined and
 // any conditionals are met.
 func (c *Conn) maybeRebindOnError(os string, err error) bool {
-	switch err {
-	case syscall.EPERM:
+	switch {
+	case errors.Is(err, syscall.EPERM):
 		why := "operation-not-permitted-rebind"
 		switch os {
 		// We currently will only rebind and restun on a syscall.EPERM if it is experienced
@@ -1172,7 +1305,25 @@ func (c *Conn) maybeRebindOnError(os string, err error) bool {
 	return false
 }
 
-// sendUDP sends UDP packet b to addr.
+// sendUDPNetcheck sends b via UDP to addr. It is used exclusively by netcheck.
+// It returns the number of bytes sent along with any error encountered. It
+// returns errors.ErrUnsupported if the client is explicitly configured to only
+// send data over TCP port 443 and/or we're running on wasm.
+func (c *Conn) sendUDPNetcheck(b []byte, addr netip.AddrPort) (int, error) {
+	if c.onlyTCP443.Load() || runtime.GOOS == "js" {
+		return 0, errors.ErrUnsupported
+	}
+	switch {
+	case addr.Addr().Is4():
+		return c.pconn4.WriteToUDPAddrPort(b, addr)
+	case addr.Addr().Is6():
+		return c.pconn6.WriteToUDPAddrPort(b, addr)
+	default:
+		panic("bogus sendUDPNetcheck addr type")
+	}
+}
+
+// sendUDPStd sends UDP packet b to addr.
 // See sendAddr's docs on the return value meanings.
 func (c *Conn) sendUDPStd(addr netip.AddrPort, b []byte) (sent bool, err error) {
 	if c.onlyTCP443.Load() {
@@ -1258,26 +1409,36 @@ func (c *Conn) putReceiveBatch(batch *receiveBatch) {
 	c.receiveBatchPool.Put(batch)
 }
 
-// receiveIPv4 creates an IPv4 ReceiveFunc reading from c.pconn4.
 func (c *Conn) receiveIPv4() conn.ReceiveFunc {
-	return c.mkReceiveFunc(&c.pconn4, c.health.ReceiveFuncStats(health.ReceiveIPv4), metricRecvDataIPv4)
+	return c.mkReceiveFunc(&c.pconn4, c.health.ReceiveFuncStats(health.ReceiveIPv4),
+		&c.metrics.inboundPacketsIPv4Total,
+		&c.metrics.inboundBytesIPv4Total,
+	)
 }
 
 // receiveIPv6 creates an IPv6 ReceiveFunc reading from c.pconn6.
 func (c *Conn) receiveIPv6() conn.ReceiveFunc {
-	return c.mkReceiveFunc(&c.pconn6, c.health.ReceiveFuncStats(health.ReceiveIPv6), metricRecvDataIPv6)
+	return c.mkReceiveFunc(&c.pconn6, c.health.ReceiveFuncStats(health.ReceiveIPv6),
+		&c.metrics.inboundPacketsIPv6Total,
+		&c.metrics.inboundBytesIPv6Total,
+	)
 }
 
 // mkReceiveFunc creates a ReceiveFunc reading from ruc.
-// The provided healthItem and metric are updated if non-nil.
-func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, healthItem *health.ReceiveFuncStats, metric *clientmetric.Metric) conn.ReceiveFunc {
+// The provided healthItem and metrics are updated if non-nil.
+func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, healthItem *health.ReceiveFuncStats, packetMetric, bytesMetric *expvar.Int) conn.ReceiveFunc {
 	// epCache caches an IPPort->endpoint for hot flows.
 	var epCache ippEndpointCache
 
-	return func(buffs [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+	return func(buffs [][]byte, sizes []int, eps []conn.Endpoint) (_ int, retErr error) {
 		if healthItem != nil {
 			healthItem.Enter()
 			defer healthItem.Exit()
+			defer func() {
+				if retErr != nil && !c.closing.Load() {
+					c.logf("Receive func %s exiting with error: %T, %v", healthItem.Name(), retErr, retErr)
+				}
+			}()
 		}
 		if ruc == nil {
 			panic("nil RebindingUDPConn")
@@ -1302,8 +1463,11 @@ func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, healthItem *health.ReceiveFu
 				}
 				ipp := msg.Addr.(*net.UDPAddr).AddrPort()
 				if ep, ok := c.receiveIP(msg.Buffers[0][:msg.N], ipp, &epCache); ok {
-					if metric != nil {
-						metric.Add(1)
+					if packetMetric != nil {
+						packetMetric.Add(1)
+					}
+					if bytesMetric != nil {
+						bytesMetric.Add(int64(msg.N))
 					}
 					eps[i] = ep
 					sizes[i] = msg.N
@@ -1359,7 +1523,7 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *ippEndpointCache) 
 	ep.lastRecvUDPAny.StoreAtomic(now)
 	ep.noteRecvActivity(ipp, now)
 	if stats := c.stats.Load(); stats != nil {
-		stats.UpdateRxPhysical(ep.nodeAddr, ipp, len(b))
+		stats.UpdateRxPhysical(ep.nodeAddr, ipp, 1, len(b))
 	}
 	return ep, true
 }
@@ -2352,6 +2516,8 @@ func (c *Conn) Close() error {
 		pinger.Close()
 	}
 
+	deregisterMetrics(c.metrics)
+
 	return nil
 }
 
@@ -2533,6 +2699,7 @@ func (c *Conn) bindSocket(ruc *RebindingUDPConn, network string, curPortFate cur
 			}
 		}
 		trySetSocketBuffer(pconn, c.logf)
+		trySetUDPSocketOptions(pconn, c.logf)
 
 		// Success.
 		if debugBindSocket() {
@@ -2904,17 +3071,17 @@ var (
 	metricSendDERPErrorChan   = clientmetric.NewCounter("magicsock_send_derp_error_chan")
 	metricSendDERPErrorClosed = clientmetric.NewCounter("magicsock_send_derp_error_closed")
 	metricSendDERPErrorQueue  = clientmetric.NewCounter("magicsock_send_derp_error_queue")
-	metricSendUDP             = clientmetric.NewCounter("magicsock_send_udp")
+	metricSendUDP             = clientmetric.NewAggregateCounter("magicsock_send_udp")
 	metricSendUDPError        = clientmetric.NewCounter("magicsock_send_udp_error")
-	metricSendDERP            = clientmetric.NewCounter("magicsock_send_derp")
+	metricSendDERP            = clientmetric.NewAggregateCounter("magicsock_send_derp")
 	metricSendDERPError       = clientmetric.NewCounter("magicsock_send_derp_error")
 
 	// Data packets (non-disco)
 	metricSendData            = clientmetric.NewCounter("magicsock_send_data")
 	metricSendDataNetworkDown = clientmetric.NewCounter("magicsock_send_data_network_down")
-	metricRecvDataDERP        = clientmetric.NewCounter("magicsock_recv_data_derp")
-	metricRecvDataIPv4        = clientmetric.NewCounter("magicsock_recv_data_ipv4")
-	metricRecvDataIPv6        = clientmetric.NewCounter("magicsock_recv_data_ipv6")
+	metricRecvDataPacketsDERP = clientmetric.NewAggregateCounter("magicsock_recv_data_derp")
+	metricRecvDataPacketsIPv4 = clientmetric.NewAggregateCounter("magicsock_recv_data_ipv4")
+	metricRecvDataPacketsIPv6 = clientmetric.NewAggregateCounter("magicsock_recv_data_ipv6")
 
 	// Disco packets
 	metricSendDiscoUDP               = clientmetric.NewCounter("magicsock_disco_send_udp")
@@ -3001,18 +3168,9 @@ func getPeerMTUsProbedMetric(mtu tstun.WireMTU) *clientmetric.Metric {
 	return mm
 }
 
-// GetLastNetcheckReport returns the last netcheck report, running a new one if a recent one does not exist.
+// GetLastNetcheckReport returns the last netcheck report, returning nil if a recent one does not exist.
 func (c *Conn) GetLastNetcheckReport(ctx context.Context) *netcheck.Report {
-	lastReport := c.lastNetCheckReport.Load()
-	if lastReport == nil {
-		nr, err := c.updateNetInfo(ctx)
-		if err != nil {
-			c.logf("magicsock.Conn.GetLastNetcheckReport: updateNetInfo: %v", err)
-			return nil
-		}
-		return nr
-	}
-	return lastReport
+	return c.lastNetCheckReport.Load()
 }
 
 // SetLastNetcheckReportForTest sets the magicsock conn's last netcheck report.

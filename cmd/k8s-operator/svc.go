@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/kube/kubetypes"
 	"tailscale.com/net/dns/resolvconffile"
 	"tailscale.com/tstime"
 	"tailscale.com/util/clientmetric"
@@ -62,15 +63,17 @@ type ServiceReconciler struct {
 	tsNamespace string
 
 	clock tstime.Clock
+
+	defaultProxyClass string
 }
 
 var (
 	// gaugeEgressProxies tracks the number of egress proxies that we're
 	// currently managing.
-	gaugeEgressProxies = clientmetric.NewGauge("k8s_egress_proxies")
+	gaugeEgressProxies = clientmetric.NewGauge(kubetypes.MetricEgressProxyCount)
 	// gaugeIngressProxies tracks the number of ingress proxies that we're
 	// currently managing.
-	gaugeIngressProxies = clientmetric.NewGauge("k8s_ingress_proxies")
+	gaugeIngressProxies = clientmetric.NewGauge(kubetypes.MetricIngressProxyCount)
 )
 
 func childResourceLabels(name, ns, typ string) map[string]string {
@@ -107,6 +110,10 @@ func (a *ServiceReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		return reconcile.Result{}, nil
 	} else if err != nil {
 		return reconcile.Result{}, fmt.Errorf("failed to get svc: %w", err)
+	}
+
+	if _, ok := svc.Annotations[AnnotationProxyGroup]; ok {
+		return reconcile.Result{}, nil // this reconciler should not look at Services for ProxyGroup
 	}
 
 	if !svc.DeletionTimestamp.IsZero() || !a.isTailscaleService(svc) {
@@ -208,7 +215,7 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		return nil
 	}
 
-	proxyClass := proxyClassForObject(svc)
+	proxyClass := proxyClassForObject(svc, a.defaultProxyClass)
 	if proxyClass != "" {
 		if ready, err := proxyClassIsReady(ctx, proxyClass, a.Client); err != nil {
 			errMsg := fmt.Errorf("error verifying ProxyClass for Service: %w", err)
@@ -325,7 +332,7 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 	if err != nil {
 		msg := fmt.Sprintf("failed to parse cluster IP: %v", err)
 		tsoperator.SetServiceCondition(svc, tsapi.ProxyReady, metav1.ConditionFalse, reasonProxyFailed, msg, a.clock, logger)
-		return fmt.Errorf(msg)
+		return errors.New(msg)
 	}
 	for _, ip := range tsIPs {
 		addr, err := netip.ParseAddr(ip)
@@ -351,6 +358,10 @@ func validateService(svc *corev1.Service) []string {
 			violations = append(violations, fmt.Sprintf("invalid value of annotation %s: %q does not appear to be a valid MagicDNS name", AnnotationTailnetTargetFQDN, fqdn))
 		}
 	}
+
+	// TODO(irbekrm): validate that tailscale.com/tailnet-ip annotation is a
+	// valid IP address (tailscale/tailscale#13671).
+
 	svcName := nameForService(svc)
 	if err := dnsname.ValidLabel(svcName); err != nil {
 		if _, ok := svc.Annotations[AnnotationHostname]; ok {
@@ -404,8 +415,14 @@ func tailnetTargetAnnotation(svc *corev1.Service) string {
 	return svc.Annotations[annotationTailnetTargetIPOld]
 }
 
-func proxyClassForObject(o client.Object) string {
-	return o.GetLabels()[LabelProxyClass]
+// proxyClassForObject returns the proxy class for the given object. If the
+// object does not have a proxy class label, it returns the default proxy class
+func proxyClassForObject(o client.Object, proxyDefaultClass string) string {
+	proxyClass, exists := o.GetLabels()[LabelProxyClass]
+	if !exists {
+		proxyClass = proxyDefaultClass
+	}
+	return proxyClass
 }
 
 func proxyClassIsReady(ctx context.Context, name string, cl client.Client) (bool, error) {

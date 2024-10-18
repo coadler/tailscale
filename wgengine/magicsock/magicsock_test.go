@@ -28,6 +28,7 @@ import (
 	"time"
 	"unsafe"
 
+	qt "github.com/frankban/quicktest"
 	wgconn "github.com/tailscale/wireguard-go/conn"
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun/tuntest"
@@ -64,6 +65,7 @@ import (
 	"tailscale.com/util/cibuild"
 	"tailscale.com/util/racebuild"
 	"tailscale.com/util/set"
+	"tailscale.com/util/usermetric"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/wgcfg"
 	"tailscale.com/wgengine/wgcfg/nmcfg"
@@ -156,6 +158,7 @@ type magicStack struct {
 	dev        *device.Device          // the wireguard-go Device that connects the previous things
 	wgLogger   *wglog.Logger           // wireguard-go log wrapper
 	netMon     *netmon.Monitor         // always non-nil
+	metrics    *usermetric.Registry
 }
 
 // newMagicStack builds and initializes an idle magicsock and
@@ -173,11 +176,15 @@ func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListen
 	if err != nil {
 		t.Fatalf("netmon.New: %v", err)
 	}
+	ht := new(health.Tracker)
 
+	var reg usermetric.Registry
 	epCh := make(chan []tailcfg.Endpoint, 100) // arbitrary
 	conn, err := NewConn(Options{
 		NetMon:                 netMon,
+		Metrics:                &reg,
 		Logf:                   logf,
+		HealthTracker:          ht,
 		DisablePortMapper:      true,
 		TestOnlyPacketListener: l,
 		EndpointsFunc: func(eps []tailcfg.Endpoint) {
@@ -193,7 +200,7 @@ func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListen
 	}
 
 	tun := tuntest.NewChannelTUN()
-	tsTun := tstun.Wrap(logf, tun.TUN())
+	tsTun := tstun.Wrap(logf, tun.TUN(), &reg)
 	tsTun.SetFilter(filter.NewAllowAllForTest(logf))
 	tsTun.Start()
 
@@ -219,6 +226,7 @@ func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListen
 		dev:        dev,
 		wgLogger:   wgLogger,
 		netMon:     netMon,
+		metrics:    &reg,
 	}
 }
 
@@ -397,6 +405,7 @@ func TestNewConn(t *testing.T) {
 		EndpointsFunc:     epFunc,
 		Logf:              t.Logf,
 		NetMon:            netMon,
+		Metrics:           new(usermetric.Registry),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -523,6 +532,7 @@ func TestDeviceStartStop(t *testing.T) {
 		EndpointsFunc: func(eps []tailcfg.Endpoint) {},
 		Logf:          t.Logf,
 		NetMon:        netMon,
+		Metrics:       new(usermetric.Registry),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1181,6 +1191,91 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 		checkStats(t, m1, m1Conns)
 		checkStats(t, m2, m2Conns)
 	})
+	t.Run("compare-metrics-stats", func(t *testing.T) {
+		setT(t)
+		defer setT(outerT)
+		m1.conn.resetMetricsForTest()
+		m1.stats.TestExtract()
+		m2.conn.resetMetricsForTest()
+		m2.stats.TestExtract()
+		t.Logf("Metrics before: %s\n", m1.metrics.String())
+		ping1(t)
+		ping2(t)
+		assertConnStatsAndUserMetricsEqual(t, m1)
+		assertConnStatsAndUserMetricsEqual(t, m2)
+		t.Logf("Metrics after: %s\n", m1.metrics.String())
+	})
+}
+
+func (c *Conn) resetMetricsForTest() {
+	c.metrics.inboundBytesIPv4Total.Set(0)
+	c.metrics.inboundPacketsIPv4Total.Set(0)
+	c.metrics.outboundBytesIPv4Total.Set(0)
+	c.metrics.outboundPacketsIPv4Total.Set(0)
+	c.metrics.inboundBytesIPv6Total.Set(0)
+	c.metrics.inboundPacketsIPv6Total.Set(0)
+	c.metrics.outboundBytesIPv6Total.Set(0)
+	c.metrics.outboundPacketsIPv6Total.Set(0)
+	c.metrics.inboundBytesDERPTotal.Set(0)
+	c.metrics.inboundPacketsDERPTotal.Set(0)
+	c.metrics.outboundBytesDERPTotal.Set(0)
+	c.metrics.outboundPacketsDERPTotal.Set(0)
+}
+
+func assertConnStatsAndUserMetricsEqual(t *testing.T, ms *magicStack) {
+	_, phys := ms.stats.TestExtract()
+
+	physIPv4RxBytes := int64(0)
+	physIPv4TxBytes := int64(0)
+	physDERPRxBytes := int64(0)
+	physDERPTxBytes := int64(0)
+	physIPv4RxPackets := int64(0)
+	physIPv4TxPackets := int64(0)
+	physDERPRxPackets := int64(0)
+	physDERPTxPackets := int64(0)
+	for conn, count := range phys {
+		t.Logf("physconn src: %s, dst: %s", conn.Src.String(), conn.Dst.String())
+		if conn.Dst.String() == "127.3.3.40:1" {
+			physDERPRxBytes += int64(count.RxBytes)
+			physDERPTxBytes += int64(count.TxBytes)
+			physDERPRxPackets += int64(count.RxPackets)
+			physDERPTxPackets += int64(count.TxPackets)
+		} else {
+			physIPv4RxBytes += int64(count.RxBytes)
+			physIPv4TxBytes += int64(count.TxBytes)
+			physIPv4RxPackets += int64(count.RxPackets)
+			physIPv4TxPackets += int64(count.TxPackets)
+		}
+	}
+
+	metricIPv4RxBytes := ms.conn.metrics.inboundBytesIPv4Total.Value()
+	metricIPv4RxPackets := ms.conn.metrics.inboundPacketsIPv4Total.Value()
+	metricIPv4TxBytes := ms.conn.metrics.outboundBytesIPv4Total.Value()
+	metricIPv4TxPackets := ms.conn.metrics.outboundPacketsIPv4Total.Value()
+
+	metricDERPRxBytes := ms.conn.metrics.inboundBytesDERPTotal.Value()
+	metricDERPRxPackets := ms.conn.metrics.inboundPacketsDERPTotal.Value()
+	metricDERPTxBytes := ms.conn.metrics.outboundBytesDERPTotal.Value()
+	metricDERPTxPackets := ms.conn.metrics.outboundPacketsDERPTotal.Value()
+
+	c := qt.New(t)
+	c.Assert(physDERPRxBytes, qt.Equals, metricDERPRxBytes)
+	c.Assert(physDERPTxBytes, qt.Equals, metricDERPTxBytes)
+	c.Assert(physIPv4RxBytes, qt.Equals, metricIPv4RxBytes)
+	c.Assert(physIPv4TxBytes, qt.Equals, metricIPv4TxBytes)
+	c.Assert(physDERPRxPackets, qt.Equals, metricDERPRxPackets)
+	c.Assert(physDERPTxPackets, qt.Equals, metricDERPTxPackets)
+	c.Assert(physIPv4RxPackets, qt.Equals, metricIPv4RxPackets)
+	c.Assert(physIPv4TxPackets, qt.Equals, metricIPv4TxPackets)
+
+	// Validate that the usermetrics and clientmetrics are in sync
+	// Note: the clientmetrics are global, this means that when they are registering with the
+	// wgengine, multiple in-process nodes used by this test will be updating the same metrics. This is why we need to multiply
+	// the metrics by 2 to get the expected value.
+	// TODO(kradalby): https://github.com/tailscale/tailscale/issues/13420
+	c.Assert(metricSendUDP.Value(), qt.Equals, metricIPv4TxPackets*2)
+	c.Assert(metricRecvDataPacketsIPv4.Value(), qt.Equals, metricIPv4RxPackets*2)
+	c.Assert(metricRecvDataPacketsDERP.Value(), qt.Equals, metricDERPRxPackets*2)
 }
 
 func TestDiscoMessage(t *testing.T) {
@@ -1275,6 +1370,7 @@ func newTestConn(t testing.TB) *Conn {
 	conn, err := NewConn(Options{
 		NetMon:                 netMon,
 		HealthTracker:          new(health.Tracker),
+		Metrics:                new(usermetric.Registry),
 		DisablePortMapper:      true,
 		Logf:                   t.Logf,
 		Port:                   port,
@@ -2957,26 +3053,31 @@ func TestMaybeRebindOnError(t *testing.T) {
 	tstest.PanicOnLog()
 	tstest.ResourceCheck(t)
 
-	conn := newTestConn(t)
-	defer conn.Close()
+	err := fmt.Errorf("outer err: %w", syscall.EPERM)
 
 	t.Run("darwin-rebind", func(t *testing.T) {
-		rebound := conn.maybeRebindOnError("darwin", syscall.EPERM)
+		conn := newTestConn(t)
+		defer conn.Close()
+		rebound := conn.maybeRebindOnError("darwin", err)
 		if !rebound {
 			t.Errorf("darwin should rebind on syscall.EPERM")
 		}
 	})
 
 	t.Run("linux-not-rebind", func(t *testing.T) {
-		rebound := conn.maybeRebindOnError("linux", syscall.EPERM)
+		conn := newTestConn(t)
+		defer conn.Close()
+		rebound := conn.maybeRebindOnError("linux", err)
 		if rebound {
 			t.Errorf("linux should not rebind on syscall.EPERM")
 		}
 	})
 
 	t.Run("no-frequent-rebind", func(t *testing.T) {
+		conn := newTestConn(t)
+		defer conn.Close()
 		conn.lastEPERMRebind.Store(time.Now().Add(-1 * time.Second))
-		rebound := conn.maybeRebindOnError("darwin", syscall.EPERM)
+		rebound := conn.maybeRebindOnError("darwin", err)
 		if rebound {
 			t.Errorf("darwin should not rebind on syscall.EPERM within 5 seconds of last")
 		}

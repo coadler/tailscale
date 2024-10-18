@@ -19,6 +19,7 @@ import (
 // Only one of Src/Dst or Users/Ports may be specified.
 type ACLRow struct {
 	Action string   `json:"action,omitempty"` // valid values: "accept"
+	Proto  string   `json:"proto,omitempty"`  // protocol
 	Users  []string `json:"users,omitempty"`  // old name for src
 	Ports  []string `json:"ports,omitempty"`  // old name for dst
 	Src    []string `json:"src,omitempty"`
@@ -31,6 +32,7 @@ type ACLRow struct {
 type ACLTest struct {
 	Src    string   `json:"src,omitempty"`    // source
 	User   string   `json:"user,omitempty"`   // old name for source
+	Proto  string   `json:"proto,omitempty"`  // protocol
 	Accept []string `json:"accept,omitempty"` // expected destination ip:port that user can access
 	Deny   []string `json:"deny,omitempty"`   // expected destination ip:port that user cannot access
 
@@ -286,6 +288,9 @@ type UserRuleMatch struct {
 	Users      []string `json:"users"`
 	Ports      []string `json:"ports"`
 	LineNumber int      `json:"lineNumber"`
+	// Via is the list of targets through which Users can access Ports.
+	// See https://tailscale.com/kb/1378/via for more information.
+	Via []string `json:"via,omitempty"`
 
 	// Postures is a list of posture policies that are
 	// associated with this match. The rules can be looked

@@ -5,6 +5,7 @@ package vnet
 
 import (
 	"errors"
+	"log"
 	"math/rand/v2"
 	"net/netip"
 	"time"
@@ -14,7 +15,8 @@ import (
 
 const (
 	One2OneNAT NAT = "one2one"
-	EasyNAT    NAT = "easy"
+	EasyNAT    NAT = "easy"   // address+port filtering
+	EasyAFNAT  NAT = "easyaf" // address filtering (not port)
 	HardNAT    NAT = "hard"
 )
 
@@ -32,7 +34,11 @@ type IPPool interface {
 	// and if so, its IP address.
 	SoleLANIP() (_ netip.Addr, ok bool)
 
-	// TODO: port availability stuff for interacting with portmapping
+	// IsPublicPortUsed reports whether the provided WAN IP+port is in use by
+	// anything. (In particular, the NAT-PMP/etc port mappers might have taken
+	// a port.) Implementations should check this before allocating a port,
+	// and then they should report IsPublicPortUsed themselves for that port.
+	IsPublicPortUsed(netip.AddrPort) bool
 }
 
 // newTableFunc is a constructor for a NAT table.
@@ -85,6 +91,10 @@ type NATTable interface {
 	// address of a machine on the local network address, usually a private
 	// LAN IP.
 	PickIncomingDst(src, dst netip.AddrPort, at time.Time) (lanDst netip.AddrPort)
+
+	// IsPublicPortUsed reports whether the provided WAN IP+port is in use by
+	// anything. The port mapper uses this to avoid grabbing an in-use port.
+	IsPublicPortUsed(netip.AddrPort) bool
 }
 
 // oneToOneNAT is a 1:1 NAT, like a typical EC2 VM.
@@ -111,9 +121,13 @@ func (n *oneToOneNAT) PickIncomingDst(src, dst netip.AddrPort, at time.Time) (la
 	return netip.AddrPortFrom(n.lanIP, dst.Port())
 }
 
-type hardKeyOut struct {
-	lanIP netip.Addr
-	dst   netip.AddrPort
+func (n *oneToOneNAT) IsPublicPortUsed(netip.AddrPort) bool {
+	return true // all ports are owned by the 1:1 NAT
+}
+
+type srcDstTuple struct {
+	src netip.AddrPort
+	dst netip.AddrPort
 }
 
 type hardKeyIn struct {
@@ -135,20 +149,33 @@ type lanAddrAndTime struct {
 // This is shown as "MappingVariesByDestIP: true" by netcheck, and what
 // Tailscale calls "Hard NAT".
 type hardNAT struct {
+	pool  IPPool
 	wanIP netip.Addr
 
-	out map[hardKeyOut]portMappingAndTime
+	out map[srcDstTuple]portMappingAndTime
 	in  map[hardKeyIn]lanAddrAndTime
 }
 
 func init() {
 	registerNATType(HardNAT, func(p IPPool) (NATTable, error) {
-		return &hardNAT{wanIP: p.WANIP()}, nil
+		return &hardNAT{pool: p, wanIP: p.WANIP()}, nil
 	})
 }
 
+func (n *hardNAT) IsPublicPortUsed(ap netip.AddrPort) bool {
+	if ap.Addr() != n.wanIP {
+		return false
+	}
+	for k := range n.in {
+		if k.wanPort == ap.Port() {
+			return true
+		}
+	}
+	return false
+}
+
 func (n *hardNAT) PickOutgoingSrc(src, dst netip.AddrPort, at time.Time) (wanSrc netip.AddrPort) {
-	ko := hardKeyOut{src.Addr(), dst}
+	ko := srcDstTuple{src, dst}
 	if pm, ok := n.out[ko]; ok {
 		// Existing flow.
 		// TODO: bump timestamp
@@ -164,6 +191,10 @@ func (n *hardNAT) PickOutgoingSrc(src, dst netip.AddrPort, at time.Time) (wanSrc
 	// by tests and doesn't care about performance, this is good enough.
 	for {
 		port := rand.N(uint16(32<<10)) + 32<<10 // pick some "ephemeral" port
+		if n.pool.IsPublicPortUsed(netip.AddrPortFrom(n.wanIP, port)) {
+			continue
+		}
+
 		ki := hardKeyIn{wanPort: port, src: dst}
 		if _, ok := n.in[ki]; ok {
 			// Port already in use.
@@ -196,18 +227,29 @@ func (n *hardNAT) PickIncomingDst(src, dst netip.AddrPort, at time.Time) (lanDst
 // Unlike Linux, this implementation is capped at 32k entries and doesn't resort
 // to other allocation strategies when all 32k WAN ports are taken.
 type easyNAT struct {
-	wanIP netip.Addr
-	out   map[netip.AddrPort]portMappingAndTime
-	in    map[uint16]lanAddrAndTime
+	pool    IPPool
+	wanIP   netip.Addr
+	out     map[netip.AddrPort]portMappingAndTime
+	in      map[uint16]lanAddrAndTime
+	lastOut map[srcDstTuple]time.Time // (lan:port, wan:port) => last packet out time
 }
 
 func init() {
 	registerNATType(EasyNAT, func(p IPPool) (NATTable, error) {
-		return &easyNAT{wanIP: p.WANIP()}, nil
+		return &easyNAT{pool: p, wanIP: p.WANIP()}, nil
 	})
 }
 
+func (n *easyNAT) IsPublicPortUsed(ap netip.AddrPort) bool {
+	if ap.Addr() != n.wanIP {
+		return false
+	}
+	_, ok := n.in[ap.Port()]
+	return ok
+}
+
 func (n *easyNAT) PickOutgoingSrc(src, dst netip.AddrPort, at time.Time) (wanSrc netip.AddrPort) {
+	mak.Set(&n.lastOut, srcDstTuple{src, dst}, at)
 	if pm, ok := n.out[src]; ok {
 		// Existing flow.
 		// TODO: bump timestamp
@@ -221,6 +263,9 @@ func (n *easyNAT) PickOutgoingSrc(src, dst netip.AddrPort, at time.Time) (wanSrc
 		port := 32<<10 + (start+off)%(32<<10)
 		if _, ok := n.in[port]; !ok {
 			wanAddr := netip.AddrPortFrom(n.wanIP, port)
+			if n.pool.IsPublicPortUsed(wanAddr) {
+				continue
+			}
 
 			// Found a free port.
 			mak.Set(&n.out, src, portMappingAndTime{port: port, at: at})
@@ -235,5 +280,14 @@ func (n *easyNAT) PickIncomingDst(src, dst netip.AddrPort, at time.Time) (lanDst
 	if dst.Addr() != n.wanIP {
 		return netip.AddrPort{} // drop; not for us. shouldn't happen if natlabd routing isn't broken.
 	}
-	return n.in[dst.Port()].lanAddr
+	lanDst = n.in[dst.Port()].lanAddr
+
+	// Stateful firewall: drop incoming packets that don't have traffic out.
+	// TODO(bradfitz): verify Linux does this in the router code, not in the NAT code.
+	if t, ok := n.lastOut[srcDstTuple{lanDst, src}]; !ok || at.Sub(t) > 300*time.Second {
+		log.Printf("Drop incoming packet from %v to %v; no recent outgoing packet", src, dst)
+		return netip.AddrPort{}
+	}
+
+	return lanDst
 }

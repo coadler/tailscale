@@ -7,11 +7,12 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"reflect"
 	"runtime"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 	"unsafe"
@@ -668,7 +669,8 @@ func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, ch <-chan
 				c.logf("magicsock: derp.Send(%v): %v", wr.addr, err)
 				metricSendDERPError.Add(1)
 			} else {
-				metricSendDERP.Add(1)
+				c.metrics.outboundPacketsDERPTotal.Add(1)
+				c.metrics.outboundBytesDERPTotal.Add(int64(len(wr.b)))
 			}
 		}
 	}
@@ -689,7 +691,8 @@ func (c *connBind) receiveDERP(buffs [][]byte, sizes []int, eps []conn.Endpoint)
 			// No data read occurred. Wait for another packet.
 			continue
 		}
-		metricRecvDataDERP.Add(1)
+		c.metrics.inboundPacketsDERPTotal.Add(1)
+		c.metrics.inboundBytesDERPTotal.Add(int64(n))
 		sizes[0] = n
 		eps[0] = ep
 		return 1, nil
@@ -727,7 +730,7 @@ func (c *Conn) processDERPReadResult(dm derpReadResult, b []byte) (n int, ep *en
 
 	ep.noteRecvActivity(ipp, mono.Now())
 	if stats := c.stats.Load(); stats != nil {
-		stats.UpdateRxPhysical(ep.nodeAddr, ipp, dm.n)
+		stats.UpdateRxPhysical(ep.nodeAddr, ipp, 1, dm.n)
 	}
 	return n, ep
 }
@@ -907,12 +910,7 @@ func (c *Conn) foreachActiveDerpSortedLocked(fn func(regionID int, ad activeDerp
 		}
 		return
 	}
-	ids := make([]int, 0, len(c.activeDerp))
-	for id := range c.activeDerp {
-		ids = append(ids, id)
-	}
-	sort.Ints(ids)
-	for _, id := range ids {
+	for _, id := range slices.Sorted(maps.Keys(c.activeDerp)) {
 		fn(id, c.activeDerp[id])
 	}
 }
