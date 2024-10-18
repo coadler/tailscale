@@ -280,6 +280,20 @@ func setTCPBufSizes(ipstack *stack.Stack) error {
 	return nil
 }
 
+const (
+	// maxRetries is the maximum number of retransmissions that the TCP stack should undertake for
+	// unacked TCP segments, that is, when we are trying to send TCP data and the other side is
+	// unresponsive. It does not affect TCP operation while both sides are idle. The retry timeout
+	// has a minimum of 200ms and maximum of 120s, and grows exponentially when the other side is
+	// unresponsive. The default maxRetries in gVisor is 15, which means in practice over ten
+	// minutes of unresponsiveness before we time out.  Setting to 5 should time out in 15-30s,
+	// depending on the latency of the connection.  In Coder's system we depend on Wireguard as the
+	// underlay, which retries handshakes on a 5s timer, so we don't want to shorten the timeout
+	// less than 15s or so, to give us several chances to re-establish a Wireguard session after
+	// idling.
+	maxRetries = 5
+)
+
 // Create creates and populates a new Impl.
 func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magicsock.Conn, dialer *tsdial.Dialer, dns *dns.Manager, pm *proxymap.Mapper, driveForLocal drive.FileSystemForLocal) (*Impl, error) {
 	if mc == nil {
@@ -308,6 +322,11 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 	tcpipErr := ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabledOpt)
 	if tcpipErr != nil {
 		return nil, fmt.Errorf("could not enable TCP SACK: %v", tcpipErr)
+	}
+	retries := tcpip.TCPMaxRetriesOption(maxRetries)
+	tcpipErr = ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &retries)
+	if tcpipErr != nil {
+		return nil, fmt.Errorf("could not set max retries: %v", tcpipErr)
 	}
 	if runtime.GOOS == "windows" {
 		// See https://github.com/tailscale/tailscale/issues/9707
