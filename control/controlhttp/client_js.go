@@ -14,6 +14,7 @@ import (
 
 	"github.com/coder/websocket"
 	"tailscale.com/control/controlbase"
+	"tailscale.com/control/controlhttp/controlhttpcommon"
 	"tailscale.com/net/wsconn"
 )
 
@@ -48,11 +49,11 @@ func (d *Dialer) Dial(ctx context.Context) (*ClientConn, error) {
 		// Can't set HTTP headers on the websocket request, so we have to to send
 		// the handshake via an HTTP header.
 		RawQuery: url.Values{
-			handshakeHeaderName: []string{base64.StdEncoding.EncodeToString(init)},
+			controlhttpcommon.HandshakeHeaderName: []string{base64.StdEncoding.EncodeToString(init)},
 		}.Encode(),
 	}
 	wsConn, _, err := websocket.Dial(ctx, wsURL.String(), &websocket.DialOptions{
-		Subprotocols: []string{upgradeHeaderValue},
+		Subprotocols: []string{controlhttpcommon.UpgradeHeaderValue},
 	})
 	if err != nil {
 		return nil, err

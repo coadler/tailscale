@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"iter"
 	"math"
 	"math/rand/v2"
 	"net"
@@ -983,7 +984,8 @@ func (de *endpoint) send(buffs [][]byte) error {
 		allOk := true
 		var txBytes int
 		for _, buff := range buffs {
-			ok, _ := de.c.sendAddr(derpAddr, de.publicKey, buff)
+			const isDisco = false
+			ok, _ := de.c.sendAddr(derpAddr, de.publicKey, buff, isDisco)
 			txBytes += len(buff)
 			if !ok {
 				allOk = false
@@ -991,7 +993,7 @@ func (de *endpoint) send(buffs [][]byte) error {
 		}
 
 		if stats := de.c.stats.Load(); stats != nil {
-			stats.UpdateTxPhysical(de.nodeAddr, derpAddr, 1, txBytes)
+			stats.UpdateTxPhysical(de.nodeAddr, derpAddr, len(buffs), txBytes)
 		}
 		if allOk {
 			return nil
@@ -1383,20 +1385,18 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 }
 
 func (de *endpoint) setEndpointsLocked(eps interface {
-	Len() int
-	At(i int) netip.AddrPort
+	All() iter.Seq2[int, netip.AddrPort]
 }) {
 	for _, st := range de.endpointState {
 		st.index = indexSentinelDeleted // assume deleted until updated in next loop
 	}
 
 	var newIpps []netip.AddrPort
-	for i := range eps.Len() {
+	for i, ipp := range eps.All() {
 		if i > math.MaxInt16 {
 			// Seems unlikely.
 			break
 		}
-		ipp := eps.At(i)
 		if !ipp.IsValid() {
 			de.c.logf("magicsock: bogus netmap endpoint from %v", eps)
 			continue
